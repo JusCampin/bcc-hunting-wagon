@@ -1,6 +1,7 @@
 local CARGO_TABLE <const> = 'bcc_wagon_hunting_cargo'
 local ActiveLoads = {}
 local PendingUnloads = {}
+local ButcherReservations = {}
 
 local function encodeMetaTags(tags)
     if type(tags) ~= 'table' then return nil end
@@ -335,4 +336,206 @@ Core.Callback.Register('bcc-hunting-wagon:GetHuntingCargoContents', function(sou
             end
         )
     end)
+end)
+
+local function publicButcherItem(row)
+    return {
+        id = tonumber(row.id),
+        modelHash = tonumber(row.model_hash),
+        units = math.max(1, tonumber(row.cargo_units) or 1),
+        quality = math.max(1, math.min(3, tonumber(row.quality) or 1)),
+        isSkinned = row.is_skinned == true or tonumber(row.is_skinned) == 1,
+        storedAt = row.stored_at,
+    }
+end
+
+local function restoreButcherRows(rows, callback)
+    if type(rows) ~= 'table' or #rows == 0 then
+        if callback then callback(true) end
+        return
+    end
+
+    local remaining = #rows
+    local restored = true
+    for _, row in ipairs(rows) do
+        MySQL.insert(
+            ('INSERT IGNORE INTO `%s` (`wagon_id`, `carcass_key`, `model_hash`, `cargo_units`, `quality`, `is_skinned`, `outfit_hash`, `meta_tags`, `stored_at`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'):format(CARGO_TABLE),
+            {
+                row.wagon_id,
+                row.carcass_key,
+                row.model_hash,
+                row.cargo_units,
+                row.quality,
+                row.is_skinned,
+                row.outfit_hash,
+                row.meta_tags,
+                row.stored_at,
+            },
+            function(insertId)
+                if not insertId or insertId <= 0 then restored = false end
+                remaining = remaining - 1
+                if remaining == 0 and callback then callback(restored) end
+            end
+        )
+    end
+end
+
+local function validateButcherRequest(sourceId, wagonId, callback)
+    local _, charId = ServerUtils.getCharacter(sourceId, 'butcher wagon cargo')
+    if not charId then return callback(false) end
+    validateOwnedHuntingWagon(sourceId, charId, { wagonId = wagonId }, callback)
+end
+
+exports('GetButcherCargo', function(sourceId, wagonId, callback)
+    sourceId = tonumber(sourceId)
+    wagonId = tonumber(wagonId)
+    if not sourceId or not wagonId or type(callback) ~= 'function' then return false end
+
+    validateButcherRequest(sourceId, wagonId, function(valid)
+        if not valid then return callback(false, 'invalid_wagon') end
+        MySQL.query(
+            ('SELECT `id`, `model_hash`, `cargo_units`, `quality`, `is_skinned`, `stored_at` FROM `%s` WHERE `wagon_id` = ? ORDER BY `id` ASC'):format(CARGO_TABLE),
+            { wagonId },
+            function(rows)
+                local items = {}
+                for _, row in ipairs(rows or {}) do items[#items + 1] = publicButcherItem(row) end
+                cargoStatus(wagonId, function(used, capacity)
+                    callback(true, { wagonId = wagonId, used = used, capacity = capacity, items = items })
+                end)
+            end
+        )
+    end)
+    return true
+end)
+
+exports('ReserveButcherCargo', function(sourceId, wagonId, cargoIds, callback)
+    local invokingResource = GetInvokingResource()
+    sourceId = tonumber(sourceId)
+    wagonId = tonumber(wagonId)
+    if not invokingResource or not sourceId or not wagonId or type(callback) ~= 'function' then
+        return false
+    end
+
+    local selectedIds = {}
+    local seenIds = {}
+    if type(cargoIds) == 'table' then
+        for _, value in ipairs(cargoIds) do
+            local id = tonumber(value)
+            if id and not seenIds[id] then
+                seenIds[id] = true
+                selectedIds[#selectedIds + 1] = id
+            end
+        end
+    end
+
+    validateButcherRequest(sourceId, wagonId, function(valid)
+        if not valid then return callback(false, 'invalid_wagon') end
+        if ActiveLoads[wagonId] then return callback(false, 'busy') end
+        ActiveLoads[wagonId] = true
+
+        local selectSql
+        local selectParams = { wagonId }
+        if #selectedIds > 0 then
+            local placeholders = {}
+            for _, id in ipairs(selectedIds) do
+                placeholders[#placeholders + 1] = '?'
+                selectParams[#selectParams + 1] = id
+            end
+            selectSql = ('SELECT * FROM `%s` WHERE `wagon_id` = ? AND `id` IN (%s) ORDER BY `id` ASC'):format(
+                CARGO_TABLE,
+                table.concat(placeholders, ',')
+            )
+        else
+            selectSql = ('SELECT * FROM `%s` WHERE `wagon_id` = ? ORDER BY `id` ASC'):format(CARGO_TABLE)
+        end
+
+        MySQL.query(selectSql, selectParams, function(rows)
+            rows = rows or {}
+            if #rows == 0 or (#selectedIds > 0 and #rows ~= #selectedIds) then
+                ActiveLoads[wagonId] = nil
+                return callback(false, 'cargo_changed')
+            end
+
+            local deletePlaceholders = {}
+            local deleteParams = { wagonId }
+            for _, row in ipairs(rows) do
+                deletePlaceholders[#deletePlaceholders + 1] = '?'
+                deleteParams[#deleteParams + 1] = tonumber(row.id)
+            end
+            local deleteSql = ('DELETE FROM `%s` WHERE `wagon_id` = ? AND `id` IN (%s)'):format(
+                CARGO_TABLE,
+                table.concat(deletePlaceholders, ',')
+            )
+
+            MySQL.update(deleteSql, deleteParams, function(rowsAffected)
+                ActiveLoads[wagonId] = nil
+                if tonumber(rowsAffected) ~= #rows then
+                    return restoreButcherRows(rows, function()
+                        callback(false, 'cargo_changed')
+                    end)
+                end
+
+                local token = ('butcher:%s:%d:%d:%d'):format(
+                    invokingResource,
+                    wagonId,
+                    GetGameTimer(),
+                    math.random(100000, 999999)
+                )
+                local items = {}
+                for _, row in ipairs(rows) do items[#items + 1] = publicButcherItem(row) end
+                local reservation = {
+                    resource = invokingResource,
+                    source = sourceId,
+                    wagonId = wagonId,
+                    rows = rows,
+                }
+                ButcherReservations[token] = reservation
+                callback(true, { token = token, wagonId = wagonId, items = items })
+
+                SetTimeout(30000, function()
+                    if ButcherReservations[token] ~= reservation then return end
+                    ButcherReservations[token] = nil
+                    restoreButcherRows(reservation.rows, function()
+                        TriggerClientEvent('bcc-hunting-wagon:client:RefreshCargo', reservation.source)
+                    end)
+                end)
+            end)
+        end)
+    end)
+    return true
+end)
+
+exports('FinalizeButcherCargo', function(token, consumed, callback)
+    local invokingResource = GetInvokingResource()
+    local reservation = type(token) == 'string' and ButcherReservations[token] or nil
+    if not reservation or reservation.resource ~= invokingResource then
+        if type(callback) == 'function' then callback(false, 'invalid_reservation') end
+        return false
+    end
+
+    ButcherReservations[token] = nil
+    if consumed == true then
+        TriggerClientEvent('bcc-hunting-wagon:client:RefreshCargo', reservation.source)
+        if type(callback) == 'function' then callback(true) end
+        return true
+    end
+
+    restoreButcherRows(reservation.rows, function(restored)
+        TriggerClientEvent('bcc-hunting-wagon:client:RefreshCargo', reservation.source)
+        if type(callback) == 'function' then
+            callback(restored, restored and nil or 'restore_failed')
+        end
+    end)
+    return true
+end)
+
+AddEventHandler('onResourceStop', function(resourceName)
+    for token, reservation in pairs(ButcherReservations) do
+        if reservation.resource == resourceName or resourceName == GetCurrentResourceName() then
+            ButcherReservations[token] = nil
+            restoreButcherRows(reservation.rows, function()
+                TriggerClientEvent('bcc-hunting-wagon:client:RefreshCargo', reservation.source)
+            end)
+        end
+    end
 end)
