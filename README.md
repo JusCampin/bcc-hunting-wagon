@@ -17,6 +17,7 @@ Hunter Cart feature package for `bcc-wagons`.
 - `bcc-wagons`
 - `bcc-animal-data`
 - `bcc-utils`
+- `feather-menu`
 - `vorp_core`
 - `oxmysql`
 
@@ -30,7 +31,7 @@ can be reviewed and unloaded individually.
 
 ## Butcher integration
 
-The server API lets a butcher resource inspect and transactionally consume
+The server-only API lets a butcher resource inspect and transactionally consume
 cargo without reading this resource's database directly.
 
 ```lua
@@ -43,3 +44,6 @@ exports['bcc-hunting-wagon']:FinalizeButcherCargo(token, consumed, callback)
 token plus the reserved items. Call `FinalizeButcherCargo` with `true` only
 after payment succeeds. Passing `false`, allowing the reservation to time out,
 or stopping the calling resource restores the cargo.
+
+Pass an array of cargo row IDs to reserve selected carcasses. Passing an empty
+array reserves all current cargo. Reservations expire after 30 seconds.
