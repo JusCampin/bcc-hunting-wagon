@@ -192,6 +192,10 @@ function RefreshHuntingCargo()
     end, request)
 end
 
+RegisterNetEvent('bcc-hunting-wagon:client:RefreshCargo', function()
+    RefreshHuntingCargo()
+end)
+
 function ClearHuntingCargoForTesting()
     local request = huntingWagonRequest()
     if not request then return false end
