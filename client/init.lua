@@ -1,7 +1,7 @@
 Core = exports.vorp_core:GetCore()
 FeatherMenu = exports['feather-menu'].initiate()
-local utils = exports['bcc-utils'].initiate()
-DBG = utils.Debug:Get('bcc-hunting-wagon', Config.development.enabled)
+BccUtils = exports['bcc-utils'].initiate()
+DBG = BccUtils.Debug:Get('bcc-hunting-wagon', Config.development.enabled)
 if DBG then DBG:Enable() end
 
 MyWagon, MyWagonId, MyWagonModel = 0, nil, nil
@@ -13,6 +13,7 @@ exports['bcc-wagons']:RegisterWagonFeature(Config.huntingWagon.model or 'hunterc
 
 local function syncActiveWagon(data)
     if type(data) ~= 'table' then
+        if ResetHuntingPrompts then ResetHuntingPrompts() end
         MyWagon, MyWagonId, MyWagonModel = 0, nil, nil
         return false
     end
@@ -42,6 +43,7 @@ end)
 
 AddEventHandler('bcc-wagons:client:wagonReturning', function(data)
     if type(data) == 'table' and tonumber(data.id) == tonumber(MyWagonId) then
+        if ResetHuntingPrompts then ResetHuntingPrompts() end
         MyWagon, MyWagonId, MyWagonModel = 0, nil, nil
     end
 end)
