@@ -14,6 +14,7 @@ shared_scripts {
 }
 
 client_scripts {
+    'client/event_data.lua',
     'client/init.lua',
     'client/features.lua',
     'client/hunting.lua',
