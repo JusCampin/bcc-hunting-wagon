@@ -119,6 +119,10 @@ Core.Callback.Register('bcc-hunting-wagon:LoadHuntingCarcass', function(source, 
     if not modelHash or not carcassKey or #carcassKey < 1 or #carcassKey > 64 then
         return cb(false, 'invalid')
     end
+    local animal = exports['bcc-animal-data']:GetAnimal(modelHash)
+    if type(animal) == 'table' and animal.wagonStorable == false then
+        return cb(false, 'unsupported')
+    end
 
     validateOwnedHuntingWagon(src, charId, data, function(valid, wagonId)
         if not valid then return cb(false, 'invalid') end
@@ -127,7 +131,7 @@ Core.Callback.Register('bcc-hunting-wagon:LoadHuntingCarcass', function(source, 
 
         cargoStatus(wagonId, function(used, capacity)
             local units = getAnimalSize(modelHash)
-            local quality = math.max(1, math.min(3, math.floor(tonumber(data.quality) or 1)))
+            local quality = math.max(0, math.min(2, math.floor(tonumber(data.quality) or 0)))
             local isSkinned = data.isSkinned == true and 1 or 0
             local outfitHash = tonumber(data.outfitHash) or 0
             local metaTags = encodeMetaTags(data.metaTags)
@@ -141,7 +145,17 @@ Core.Callback.Register('bcc-hunting-wagon:LoadHuntingCarcass', function(source, 
                 { wagonId, carcassKey, modelHash, units, quality, isSkinned, outfitHash, metaTags },
                 function(insertId)
                     ActiveLoads[wagonId] = nil
-                    if not insertId or insertId <= 0 then return cb(false, 'duplicate') end
+                    if not insertId or insertId <= 0 then
+                        DBG:Warning(('Hunting cargo insert rejected: wagon=%s key=%s model=%s used=%s units=%s capacity=%s'):format(
+                            tostring(wagonId),
+                            tostring(carcassKey),
+                            tostring(modelHash),
+                            tostring(used),
+                            tostring(units),
+                            tostring(capacity)
+                        ))
+                        return cb(false, 'duplicate')
+                    end
                     cb(true, nil, { used = used + units, capacity = capacity })
                 end
             )
@@ -216,7 +230,7 @@ Core.Callback.Register('bcc-hunting-wagon:ReserveHuntingCarcassUnload', function
                             carcassKey = row.carcass_key,
                             modelHash = tonumber(row.model_hash),
                             units = math.max(1, tonumber(row.cargo_units) or 1),
-                            quality = math.max(1, math.min(3, tonumber(row.quality) or 1)),
+                            quality = math.max(0, math.min(2, tonumber(row.quality) or 0)),
                             isSkinned = row.is_skinned == true
                                 or tonumber(row.is_skinned) == 1,
                             outfitHash = tonumber(row.outfit_hash) or 0,
@@ -295,7 +309,7 @@ CreateThread(function()
             `carcass_key` VARCHAR(64) NOT NULL,
             `model_hash` BIGINT NOT NULL,
             `cargo_units` TINYINT UNSIGNED NOT NULL DEFAULT 1,
-            `quality` TINYINT UNSIGNED NOT NULL DEFAULT 1,
+            `quality` TINYINT UNSIGNED NOT NULL DEFAULT 0,
             `is_skinned` TINYINT(1) NOT NULL DEFAULT 0,
             `outfit_hash` BIGINT NOT NULL DEFAULT 0,
             `meta_tags` LONGTEXT NULL,
@@ -327,7 +341,7 @@ Core.Callback.Register('bcc-hunting-wagon:GetHuntingCargoContents', function(sou
                             id = tonumber(row.id),
                             modelHash = tonumber(row.model_hash),
                             units = math.max(1, tonumber(row.cargo_units) or 1),
-                            quality = math.max(1, math.min(3, tonumber(row.quality) or 1)),
+                            quality = math.max(0, math.min(2, tonumber(row.quality) or 0)),
                             isSkinned = row.is_skinned == true or tonumber(row.is_skinned) == 1,
                         }
                     end
@@ -343,7 +357,7 @@ local function publicButcherItem(row)
         id = tonumber(row.id),
         modelHash = tonumber(row.model_hash),
         units = math.max(1, tonumber(row.cargo_units) or 1),
-        quality = math.max(1, math.min(3, tonumber(row.quality) or 1)),
+        quality = math.max(0, math.min(2, tonumber(row.quality) or 0)),
         isSkinned = row.is_skinned == true or tonumber(row.is_skinned) == 1,
         storedAt = row.stored_at,
     }
@@ -383,20 +397,43 @@ end
 local function validateButcherRequest(sourceId, wagonId, callback)
     local _, charId = ServerUtils.getCharacter(sourceId, 'butcher wagon cargo')
     if not charId then return callback(false) end
-    validateOwnedHuntingWagon(sourceId, charId, { wagonId = wagonId }, callback)
+    validateOwnedHuntingWagonRecord(sourceId, charId, { wagonId = wagonId }, function(valid, ownedWagonId)
+        if not valid then return callback(false) end
+        local playerPed = GetPlayerPed(sourceId)
+        if playerPed == 0 then return callback(false) end
+
+        local playerCoords = GetEntityCoords(playerPed)
+        local maximumDistance = tonumber(huntingSettings().butcherInteractionDistance) or 15.0
+        for _, vehicle in ipairs(GetAllVehicles()) do
+            if tonumber(Entity(vehicle).state.myWagonId) == ownedWagonId
+                and #(playerCoords - GetEntityCoords(vehicle)) <= maximumDistance then
+                return callback(true, ownedWagonId)
+            end
+        end
+        callback(false)
+    end)
 end
 
 exports('GetButcherCargo', function(sourceId, wagonId, callback)
     sourceId = tonumber(sourceId)
     wagonId = tonumber(wagonId)
-    if not sourceId or not wagonId or type(callback) ~= 'function' then return false end
+    DBG:Info(('Butcher cargo export called: player=%s wagon=%s callback=%s'):format(
+        tostring(sourceId), tostring(wagonId), type(callback)
+    ))
+    if not sourceId or not wagonId or callback == nil then return false end
 
     validateButcherRequest(sourceId, wagonId, function(valid)
+        DBG:Info(('Butcher cargo validation completed: player=%s wagon=%s valid=%s'):format(
+            tostring(sourceId), tostring(wagonId), tostring(valid)
+        ))
         if not valid then return callback(false, 'invalid_wagon') end
         MySQL.query(
             ('SELECT `id`, `model_hash`, `cargo_units`, `quality`, `is_skinned`, `stored_at` FROM `%s` WHERE `wagon_id` = ? ORDER BY `id` ASC'):format(CARGO_TABLE),
             { wagonId },
             function(rows)
+                DBG:Info(('Butcher cargo query completed: wagon=%s rows=%s'):format(
+                    tostring(wagonId), tostring(rows and #rows or 0)
+                ))
                 local items = {}
                 for _, row in ipairs(rows or {}) do items[#items + 1] = publicButcherItem(row) end
                 cargoStatus(wagonId, function(used, capacity)
@@ -412,7 +449,7 @@ exports('ReserveButcherCargo', function(sourceId, wagonId, cargoIds, callback)
     local invokingResource = GetInvokingResource()
     sourceId = tonumber(sourceId)
     wagonId = tonumber(wagonId)
-    if not invokingResource or not sourceId or not wagonId or type(callback) ~= 'function' then
+    if not invokingResource or not sourceId or not wagonId or callback == nil then
         return false
     end
 
@@ -509,20 +546,20 @@ exports('FinalizeButcherCargo', function(token, consumed, callback)
     local invokingResource = GetInvokingResource()
     local reservation = type(token) == 'string' and ButcherReservations[token] or nil
     if not reservation or reservation.resource ~= invokingResource then
-        if type(callback) == 'function' then callback(false, 'invalid_reservation') end
+        if callback ~= nil then callback(false, 'invalid_reservation') end
         return false
     end
 
     ButcherReservations[token] = nil
     if consumed == true then
         TriggerClientEvent('bcc-hunting-wagon:client:RefreshCargo', reservation.source)
-        if type(callback) == 'function' then callback(true) end
+        if callback ~= nil then callback(true) end
         return true
     end
 
     restoreButcherRows(reservation.rows, function(restored)
         TriggerClientEvent('bcc-hunting-wagon:client:RefreshCargo', reservation.source)
-        if type(callback) == 'function' then
+        if callback ~= nil then
             callback(restored, restored and nil or 'restore_failed')
         end
     end)
