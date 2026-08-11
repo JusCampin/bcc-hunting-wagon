@@ -4,8 +4,7 @@ local NATIVE_PROMPT_HAS_HOLD_MODE_COMPLETED <const> = 0xE0F65F0640EF0617
 local NATIVE_PROMPT_CONTEXT_SET_POINT <const> = 0xAE84C5EE2C384FB3
 local NATIVE_PROMPT_CONTEXT_SET_RADIUS <const> = 0x0C718001B77CA468
 local NATIVE_GET_CARCASS_QUALITY <const> = 0x88EFFED5FE8B0B4A
-local NATIVE_IS_ANIMAL_SKINNED <const> = 0x88A5564B19C15391
-local NATIVE_IS_ENTITY_FULLY_LOOTED <const> = 0x8DE41E9902E85756
+local NATIVE_GET_CARCASS_PROVISION <const> = 0x31FEF6A20F00B963
 local NATIVE_GET_PED_META_OUTFIT_HASH <const> = 0x30569F348D126A5A
 local NATIVE_GET_NUM_COMPONENTS_IN_PED <const> = 0x90403E8107B60E81
 local NATIVE_GET_META_PED_ASSET_GUIDS <const> = 0xA9C28516A6DC9D56
@@ -21,10 +20,191 @@ local HuntingUnloadPrompt = 0
 local isLoadingCarcass = false
 local huntingCargoUsed = 0
 local huntingCargoCapacity = 1
+local gatheredCarcasses = {}
+local observedCarcassQuality = {}
+local loadPromptWasEnabled = false
+local unloadPromptWasEnabled = false
 
 local function entityExists(entity)
     return entity and entity ~= 0 and DoesEntityExist(entity)
 end
+
+local function markGatheredCarcass(carcass, quality)
+    if not entityExists(carcass) or GetEntityType(carcass) ~= 1 or IsPedHuman(carcass) then
+        return false
+    end
+
+    gatheredCarcasses[carcass] = true
+    if quality ~= nil then observedCarcassQuality[carcass] = quality end
+    if NetworkGetEntityIsNetworked(carcass) then
+        -- A carcass may disappear during the skinning transition. Protect the
+        -- event dispatcher from a state-bag write against an invalid handle.
+        pcall(function()
+            Entity(carcass).state:set('bccWagonSkinned', true, true)
+            if quality ~= nil then
+                Entity(carcass).state:set('bccWagonQuality', quality, true)
+            end
+        end)
+    end
+    return true
+end
+
+local function followGatheredReplacement(modelHash, origin, quality)
+    CreateThread(function()
+        for _, delay in ipairs({ 100, 400, 1000, 2000 }) do
+            Wait(delay)
+            local closest, closestDistance
+            for _, ped in ipairs(GetGamePool('CPed')) do
+                if entityExists(ped)
+                    and GetEntityType(ped) == 1
+                    and not IsPedHuman(ped)
+                    and IsEntityDead(ped)
+                    and GetEntityModel(ped) == modelHash
+                then
+                    local distance = #(GetEntityCoords(ped) - origin)
+                    if distance <= 6.0 and (not closestDistance or distance < closestDistance) then
+                        closest, closestDistance = ped, distance
+                    end
+                end
+            end
+            if closest then markGatheredCarcass(closest, quality) end
+        end
+    end)
+end
+
+-- EVENT_LOOT_COMPLETE is emitted after skinning or plucking. Some species
+-- replace their carcass entity during this transition, so mark the event
+-- entity and then follow a nearby replacement with the same model.
+local function handleLootComplete(data)
+    local looter = tonumber(data and data.looter) or 0
+    local carcass = tonumber(data and data.carcass) or 0
+    local succeeded = tonumber(data and data.succeeded) or 0
+
+    if Config.development and Config.development.enabled then
+        DBG:Info(('Hunting gather event: looter=%d entity=%d success=%d exists=%s'):format(
+            looter, carcass, succeeded, tostring(entityExists(carcass))
+        ))
+    end
+    if looter ~= PlayerPedId() or succeeded ~= 1 or not entityExists(carcass) then return end
+    if GetEntityType(carcass) ~= 1 or IsPedHuman(carcass) then return end
+
+    local ok, err = pcall(function()
+        local modelHash = GetEntityModel(carcass)
+        local origin = GetEntityCoords(carcass)
+        local provisionHash = Citizen.InvokeNative(
+            NATIVE_GET_CARCASS_PROVISION,
+            carcass,
+            Citizen.ResultAsInteger()
+        )
+        local provisionQuality = exports['bcc-animal-data']:GetQualityFromProvision(provisionHash)
+        local retainedQuality = NetworkGetEntityIsNetworked(carcass)
+            and tonumber(Entity(carcass).state.bccWagonQuality) or nil
+        local gatheredQuality = retainedQuality
+            or observedCarcassQuality[carcass]
+            or provisionQuality
+
+        markGatheredCarcass(carcass, gatheredQuality)
+        followGatheredReplacement(modelHash, origin, gatheredQuality)
+
+        if Config.development and Config.development.enabled then
+            DBG:Info(('Hunting carcass gathered: entity=%d model=%d provision=%s quality=%s'):format(
+                carcass, modelHash, tostring(provisionHash), tostring(gatheredQuality)
+            ))
+        end
+    end)
+    if not ok and Config.development and Config.development.enabled then
+        DBG:Error(('Hunting gather processing failed: %s'):format(tostring(err)))
+    end
+end
+
+CreateThread(function()
+    while true do
+        Wait(0)
+        local eventCount = GetNumberOfEvents(0)
+        for index = 0, eventCount - 1 do
+            if GetEventAtIndex(0, index) == 1376140891 then -- EVENT_LOOT_COMPLETE
+                local eventData = EventDataView.New(24)
+                local exists = Citizen.InvokeNative(
+                    0x57EC5FA4D4D6AFCA, -- GET_EVENT_DATA
+                    0,
+                    index,
+                    eventData:Buffer(),
+                    3
+                )
+                if exists then
+                    handleLootComplete({
+                        looter = eventData:GetInt32(0),
+                        carcass = eventData:GetInt32(8),
+                        succeeded = eventData:GetInt32(16),
+                    })
+                end
+            end
+        end
+    end
+end)
+
+-- Skinning can make GET_CARCASS_QUALITY report perfect regardless of the
+-- original animal quality. Cache nearby dead animals before gathering so the
+-- wagon can preserve the quality players actually saw before skinning.
+CreateThread(function()
+    while true do
+        local playerPed = PlayerPedId()
+        local playerCoords = GetEntityCoords(playerPed)
+        local activeEntities = {}
+
+        for _, ped in ipairs(GetGamePool('CPed')) do
+            if ped ~= playerPed
+                and entityExists(ped)
+                and not IsPedHuman(ped)
+                and IsEntityDead(ped)
+            then
+                activeEntities[ped] = true
+                if gatheredCarcasses[ped] ~= true then
+                    local coords = GetEntityCoords(ped)
+                    if #(playerCoords - coords) <= 25.0 then
+                        -- Preserve the first dead-carcass reading. Later game
+                        -- state transitions can change this native even before
+                        -- the carcass is loaded into the wagon.
+                        if observedCarcassQuality[ped] == nil then
+                            local retainedQuality = NetworkGetEntityIsNetworked(ped)
+                                and tonumber(Entity(ped).state.bccWagonQuality) or nil
+                            if retainedQuality then
+                                observedCarcassQuality[ped] = retainedQuality
+                            else
+                                local nativeQuality = Citizen.InvokeNative(
+                                    NATIVE_GET_CARCASS_QUALITY,
+                                    ped,
+                                    Citizen.ResultAsInteger()
+                                )
+                                observedCarcassQuality[ped] = math.max(0, math.min(2,
+                                    tonumber(nativeQuality) or 0
+                                ))
+                            end
+                            if NetworkGetEntityIsNetworked(ped) then
+                                pcall(function()
+                                    Entity(ped).state:set(
+                                        'bccWagonQuality',
+                                        observedCarcassQuality[ped],
+                                        true
+                                    )
+                                end)
+                            end
+                        end
+                    end
+                end
+            end
+        end
+
+        for ped in pairs(observedCarcassQuality) do
+            if not activeEntities[ped] then observedCarcassQuality[ped] = nil end
+        end
+        for ped in pairs(gatheredCarcasses) do
+            if not activeEntities[ped] then gatheredCarcasses[ped] = nil end
+        end
+
+        Wait(500)
+    end
+end)
 
 local function getCarcassMetaTags(carcass)
     local tags = {}
@@ -136,10 +316,39 @@ local function createLoadPrompt()
 end
 
 local function setHuntingPromptState(loadEnabled, unloadEnabled)
+    if not loadEnabled and loadPromptWasEnabled then
+        UiPromptRestartModes(HuntingLoadPrompt)
+        Citizen.InvokeNative(
+            NATIVE_PROMPT_CONTEXT_SET_POINT,
+            HuntingLoadPrompt,
+            0.0,
+            0.0,
+            -1000.0
+        )
+    end
+    if not unloadEnabled and unloadPromptWasEnabled then
+        UiPromptRestartModes(HuntingUnloadPrompt)
+        Citizen.InvokeNative(
+            NATIVE_PROMPT_CONTEXT_SET_POINT,
+            HuntingUnloadPrompt,
+            0.0,
+            0.0,
+            -1000.0
+        )
+    end
     UiPromptSetEnabled(HuntingLoadPrompt, loadEnabled)
     UiPromptSetVisible(HuntingLoadPrompt, loadEnabled)
     UiPromptSetEnabled(HuntingUnloadPrompt, unloadEnabled)
     UiPromptSetVisible(HuntingUnloadPrompt, unloadEnabled)
+    loadPromptWasEnabled = loadEnabled
+    unloadPromptWasEnabled = unloadEnabled
+end
+
+function ResetHuntingPrompts()
+    if HuntingLoadPrompt == 0 or HuntingUnloadPrompt == 0 then return end
+    loadPromptWasEnabled = true
+    unloadPromptWasEnabled = true
+    setHuntingPromptState(false, false)
 end
 
 local function carriedDeadAnimal(playerPed)
@@ -234,6 +443,8 @@ local function deleteLoadedCarcass(playerPed, carcass)
     Wait(math.max(500, tonumber(settings.loadAnimationMs) or 1600))
 
     if not entityExists(carcass) then return end
+    gatheredCarcasses[carcass] = nil
+    observedCarcassQuality[carcass] = nil
     NetworkRequestControlOfEntity(carcass)
     local deadline = GetGameTimer() + 1000
     while not NetworkHasControlOfEntity(carcass) and GetGameTimer() < deadline do
@@ -262,42 +473,59 @@ local function loadCarcass(carcass)
     )
     local retainedQuality = NetworkGetEntityIsNetworked(carcass)
         and tonumber(Entity(carcass).state.bccWagonQuality) or nil
-    -- The game uses 0=poor, 1=good, 2=perfect. Persist the player-facing
-    -- star count (1-3) so database values match what players see. Skinning a
-    -- reconstructed carcass may make the native report perfect, so retain the
-    -- quality recorded when that carcass last left the wagon.
-    request.quality = math.max(1, math.min(3,
-        retainedQuality or ((tonumber(nativeQuality) or 0) + 1)
-    ))
-    local skinnedResult = Citizen.InvokeNative(
-        NATIVE_IS_ANIMAL_SKINNED,
+    local provisionHash = Citizen.InvokeNative(
+        NATIVE_GET_CARCASS_PROVISION,
         carcass,
         Citizen.ResultAsInteger()
     )
+    local provisionQuality = exports['bcc-animal-data']:GetQualityFromProvision(provisionHash)
+    -- The provision hash represents the final HUD quality and takes priority
+    -- over the base carcass-quality native. Reconstructed wagon carcasses keep
+    -- their explicitly restored state as the highest-priority source.
+    request.quality = math.max(0, math.min(2,
+        retainedQuality
+            or observedCarcassQuality[carcass]
+            or provisionQuality
+            or (tonumber(nativeQuality) or 0)
+    ))
     local restoredSkinnedState = NetworkGetEntityIsNetworked(carcass)
         and Entity(carcass).state.bccWagonSkinned == true
-    local fullyLooted = Citizen.InvokeNative(
-        NATIVE_IS_ENTITY_FULLY_LOOTED,
-        carcass,
-        Citizen.ResultAsInteger()
-    )
-    request.isSkinned = skinnedResult == true
-        or tonumber(skinnedResult) == 1
-        or fullyLooted == true
-        or tonumber(fullyLooted) == 1
-        or restoredSkinnedState
+    request.isSkinned = gatheredCarcasses[carcass] == true or restoredSkinnedState
+    if Config.development and Config.development.enabled then
+        DBG:Info(('Hunting carcass load state: entity=%d gathered=%s restored=%s skinned=%s nativeQuality=%s observedQuality=%s provision=%s resolvedQuality=%d'):format(
+            carcass,
+            tostring(gatheredCarcasses[carcass] == true),
+            tostring(restoredSkinnedState),
+            tostring(request.isSkinned),
+            tostring(nativeQuality),
+            tostring(observedCarcassQuality[carcass]),
+            tostring(provisionHash),
+            request.quality
+        ))
+    end
     request.metaTags = request.isSkinned and getCarcassMetaTags(carcass) or nil
     request.outfitHash = Citizen.InvokeNative(
         NATIVE_GET_PED_META_OUTFIT_HASH,
         carcass,
         Citizen.ResultAsInteger()
     )
+    -- Network IDs are recycled by RedM and are therefore not durable cargo
+    -- identifiers. Include the entity handle and load time so a new carcass
+    -- cannot collide with an older row that used the same network ID.
+    local loadNonce = GetGameTimer()
     request.carcassKey = netId and netId ~= 0
-        and ('net:%d'):format(netId)
-        or ('local:%d:%d'):format(modelHash, carcass)
+        and ('net:%d:%d:%d'):format(netId, carcass, loadNonce)
+        or ('local:%d:%d:%d'):format(modelHash, carcass, loadNonce)
 
     Core.Callback.TriggerAsync('bcc-hunting-wagon:LoadHuntingCarcass', function(success, reason, status)
         if not success then
+            if Config.development and Config.development.enabled then
+                DBG:Warning(('Hunting carcass load rejected: reason=%s key=%s model=%s'):format(
+                    tostring(reason),
+                    tostring(request.carcassKey),
+                    tostring(request.modelHash)
+                ))
+            end
             Core.NotifyRightTip(
                 reason == 'full' and _U('huntingCargoFull') or _U('huntingCargoLoadFailed'),
                 4000
@@ -401,14 +629,13 @@ function UnloadHuntingCarcass(cargoId)
 
         SetEntityVisible(carcass, true, false)
         ResetEntityAlpha(carcass)
-        local starQuality = math.max(1, math.min(3, tonumber(reservation.quality) or 1))
+        local nativeQuality = math.max(0, math.min(2, tonumber(reservation.quality) or 0))
 
         -- Quality must be present while the living ped transitions into a
         -- carcass. Setting it only after death can leave the interaction UI
         -- without a star rating even though the native later reads correctly.
-        -- The database stores visible stars (1-3), while the game quality
-        -- setter uses 0=poor, 1=good, 2=perfect.
-        local nativeQuality = starQuality - 1
+        -- Quality remains in the game's native 0=poor, 1=good, 2=perfect
+        -- format throughout storage and restoration.
         Citizen.InvokeNative(NATIVE_SET_PED_QUALITY, carcass, nativeQuality)
         -- Do not attribute the reconstructed death to the player. The wrapper's
         -- damage-source argument makes the game evaluate a fresh kill and can
@@ -418,7 +645,7 @@ function UnloadHuntingCarcass(cargoId)
         Citizen.InvokeNative(NATIVE_SET_PED_QUALITY, carcass, nativeQuality)
 
         if NetworkGetEntityIsNetworked(carcass) then
-            Entity(carcass).state:set('bccWagonQuality', starQuality, true)
+            Entity(carcass).state:set('bccWagonQuality', nativeQuality, true)
         end
 
         if Config.development and Config.development.enabled then
@@ -427,8 +654,9 @@ function UnloadHuntingCarcass(cargoId)
                 carcass,
                 Citizen.ResultAsInteger()
             )
-            DBG:Info(('Hunting carcass quality restore: stars=%d native=%s'):format(
-                starQuality,
+            DBG:Info(('Hunting carcass quality restore: stored=%d displayStars=%d native=%s'):format(
+                nativeQuality,
+                nativeQuality + 1,
                 tostring(restoredQuality)
             ))
         end
