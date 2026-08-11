@@ -12,6 +12,10 @@ Hunter Cart feature package for `bcc-wagons`.
 - Transaction-safe server exports for butcher integrations
 - Hunting-specific configuration and database schema
 
+Carcass quality is stored internally and in SQL using the native game scale:
+`0` is poor, `1` is good, and `2` is perfect. Menus convert this to one, two,
+or three stars for display.
+
 ## Dependencies
 
 - `bcc-wagons`
