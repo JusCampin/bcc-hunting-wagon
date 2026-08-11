@@ -6,7 +6,7 @@ local function animalLabel(modelHash)
 end
 
 local function qualityStars(quality)
-    return string.rep('★', math.max(1, math.min(3, tonumber(quality) or 1)))
+    return string.rep('★', math.max(0, math.min(2, tonumber(quality) or 0)) + 1)
 end
 
 local function itemLabel(item)
