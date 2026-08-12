@@ -4,6 +4,7 @@ local NATIVE_PROMPT_HAS_HOLD_MODE_COMPLETED <const> = 0xE0F65F0640EF0617
 local NATIVE_PROMPT_CONTEXT_SET_POINT <const> = 0xAE84C5EE2C384FB3
 local NATIVE_PROMPT_CONTEXT_SET_RADIUS <const> = 0x0C718001B77CA468
 local NATIVE_GET_PED_QUALITY <const> = 0x7BCC6087D130312A
+local NATIVE_GET_PED_DAMAGE_CLEANLINESS <const> = 0x88EFFED5FE8B0B4A
 local NATIVE_GET_CARCASS_PROVISION <const> = 0x31FEF6A20F00B963
 local NATIVE_GET_PED_META_OUTFIT_HASH <const> = 0x30569F348D126A5A
 local NATIVE_GET_NUM_COMPONENTS_IN_PED <const> = 0x90403E8107B60E81
@@ -13,6 +14,7 @@ local NATIVE_SET_META_PED_TAG <const> = 0xBC6DF00D7A4A6819
 local NATIVE_FIX_PED_OUTFIT <const> = 0xAAB86462966168CE
 local NATIVE_UPDATE_PED_VARIATION <const> = 0xCC8CA3E88256E58F
 local NATIVE_SET_PED_QUALITY <const> = 0xCE6B874286D640BB
+local NATIVE_SET_PED_DAMAGE_CLEANLINESS <const> = 0x7528720101A807A5
 local NATIVE_SET_ENTITY_HEALTH <const> = 0xAC2767ED8BDFAB15
 local NATIVE_SET_ENTITY_FULLY_LOOTED <const> = 0x6BCF5F3D8FFE988D
 local HuntingLoadPrompt = 0
@@ -27,6 +29,23 @@ local unloadPromptWasEnabled = false
 
 local function entityExists(entity)
     return entity and entity ~= 0 and DoesEntityExist(entity)
+end
+
+local function getLiveCarcassQuality(carcass)
+    local pedQuality = tonumber(Citizen.InvokeNative(
+        NATIVE_GET_PED_QUALITY,
+        carcass,
+        Citizen.ResultAsInteger()
+    ))
+    local damageCleanliness = tonumber(Citizen.InvokeNative(
+        NATIVE_GET_PED_DAMAGE_CLEANLINESS,
+        carcass,
+        Citizen.ResultAsInteger()
+    ))
+    if pedQuality == nil or pedQuality < 0 then return nil end
+    pedQuality = math.max(0, math.min(2, pedQuality))
+    if damageCleanliness == nil or damageCleanliness < 0 then return pedQuality end
+    return math.min(pedQuality, math.max(0, math.min(2, damageCleanliness)))
 end
 
 local function resolveCarcassQuality(carcass)
@@ -44,14 +63,10 @@ local function resolveCarcassQuality(carcass)
         Citizen.ResultAsInteger()
     )
     local provisionQuality = exports['bcc-animal-data']:GetQualityFromProvision(provisionHash)
-    local nativeQuality = Citizen.InvokeNative(
-        NATIVE_GET_PED_QUALITY,
-        carcass,
-        Citizen.ResultAsInteger()
-    )
+    local liveQuality = getLiveCarcassQuality(carcass)
     local resolvedQuality = math.max(0, math.min(2,
         provisionQuality
-            or tonumber(nativeQuality)
+            or liveQuality
             or observedCarcassQuality[carcass]
             or retainedQuality
             or 0
@@ -177,8 +192,9 @@ CreateThread(function()
     end
 end)
 
--- Cache the actual ped quality before skinning can replace the carcass entity,
--- then preserve that value through carrying, attachment, and wagon storage.
+-- Cache the final quality (base ped quality limited by damage cleanliness)
+-- before skinning can replace the carcass entity, then preserve it through
+-- carrying, attachment, and wagon storage.
 CreateThread(function()
     while true do
         local playerPed = PlayerPedId()
@@ -202,16 +218,9 @@ CreateThread(function()
                         local state = NetworkGetEntityIsNetworked(ped) and Entity(ped).state or nil
                         local restored = state and state.bccWagonRestored == true
                         if not restored then
-                            -- Follow the ped's on-ground quality so damage and
-                            -- mercy killing can finalize the displayed rating.
-                            local nativeQuality = Citizen.InvokeNative(
-                                NATIVE_GET_PED_QUALITY,
-                                ped,
-                                Citizen.ResultAsInteger()
-                            )
-                            observedCarcassQuality[ped] = math.max(0, math.min(2,
-                                tonumber(nativeQuality) or 0
-                            ))
+                            -- Damage cleanliness can lower the displayed rating
+                            -- below the animal's original ped quality.
+                            observedCarcassQuality[ped] = getLiveCarcassQuality(ped) or 0
                             if NetworkGetEntityIsNetworked(ped) then
                                 pcall(function()
                                     Entity(ped).state:set(
@@ -638,12 +647,14 @@ function UnloadHuntingCarcass(cargoId)
         -- Quality remains in the game's native 0=poor, 1=good, 2=perfect
         -- format throughout storage and restoration.
         Citizen.InvokeNative(NATIVE_SET_PED_QUALITY, carcass, nativeQuality)
+        Citizen.InvokeNative(NATIVE_SET_PED_DAMAGE_CLEANLINESS, carcass, nativeQuality)
         -- Do not attribute the reconstructed death to the player. The wrapper's
         -- damage-source argument makes the game evaluate a fresh kill and can
         -- immediately reduce the restored quality by one star.
         Citizen.InvokeNative(NATIVE_SET_ENTITY_HEALTH, carcass, 0)
         Wait(0)
         Citizen.InvokeNative(NATIVE_SET_PED_QUALITY, carcass, nativeQuality)
+        Citizen.InvokeNative(NATIVE_SET_PED_DAMAGE_CLEANLINESS, carcass, nativeQuality)
 
         if NetworkGetEntityIsNetworked(carcass) then
             Entity(carcass).state:set('bccWagonQuality', nativeQuality, true)
